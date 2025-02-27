@@ -39,14 +39,15 @@ def get_image(url):
     return Image.open(BytesIO(content)).convert("RGB")
 
 def load_model(model_name):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     if 'llava' in model_name:
         model = LlavaForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
-        ).to(0)
+        ).to(device)
     else:
-        model = AutoModelForVision2Seq.from_pretrained(model_name).to("cuda" if torch.cuda.is_available() else "cpu")
+        model = AutoModelForVision2Seq.from_pretrained(model_name).to(device)
     processor = AutoProcessor.from_pretrained(model_name,use_fast=True)
     return processor,model
 
@@ -75,8 +76,9 @@ def gemini_identify_id(url,system_prompt):
 # Huggingface repo usage
 def huggingface_detect_id_box(model_name,url):
     try:
-        image = get_image(url)
-
+        #image = get_image(url)
+        image = Image.open(requests.get(url,stream=True).raw)
+        
         system_prompt = f"""
         You are an AI document processing assistant. Analyze the provided image. Identify the ID number in the document.
         This is usually identified in a location outside of the main content on the document, and usually on the bottom
@@ -87,7 +89,20 @@ def huggingface_detect_id_box(model_name,url):
         """
 
         processor,model=load_model(model_name)
-        inputs = processor(image,text=system_prompt,return_tensors="pt").to(model.device)
+
+        conversation = [
+            {
+                "role":"user",
+                "content":[
+                    {"type":"text","text":system_prompt},
+                    {"type":"image"},
+                ],
+            },
+        ]
+        prompt = processor.apply_chat_template(conversation,add_generation_prompt=True)
+        inputs = processor(images=image,text=prompt,return_tensors="pt").to(model.device)
+
+        """
         with torch.no_grad():
             output = model.generate(**inputs)
         
@@ -98,6 +113,11 @@ def huggingface_detect_id_box(model_name,url):
         except Exception as e:
             print(f"Error parsing bounding box response: {str(e)}")
             return None
+        """
+
+        output = model.generate(**inputs,max_new_tokens=200,do_sample=False)
+        print(processor.decode(output[0][2:],skip_special_tokens=True))
+
         
         draw = ImageDraw.Draw(image)
         draw.rectangle(bbox,outline="red",width=5)
