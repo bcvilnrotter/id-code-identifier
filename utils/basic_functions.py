@@ -1,4 +1,4 @@
-import os,requests,ast,torch
+import os,requests,ast,torch,re,anthropic
 import gradio as gr
 import datetime as dt
 import google.generativeai as genai
@@ -48,48 +48,91 @@ def load_model(model_name):
         ).to(device)
     else:
         model = AutoModelForVision2Seq.from_pretrained(model_name).to(device)
+    print(f"model: {model}")
     processor = AutoProcessor.from_pretrained(model_name,use_fast=True)
+    print(f"processor: {processor}")
     return processor,model
 
-def gemini_identify_id(url,system_prompt):
+def request_manager(model_name,url):
+    image = get_image(url)
+    print(f"image: {image}")
+
+    system_prompt = f"""
+    You are an AI document processing assistant. Analyze the provided image. Identify the ID number in the document.
+    This is usually identified in a location outside of the main content on the document, and usually on the bottom
+    right or left of the document. The rotation of the number may differ based on images. Furthermore the ID number
+    is usually a string of numbers, around 9 number characters in length. Could possibly have alphabetic characters
+    as well but that looks to be rare. The output should only be a string in the format [x0,y0,x1,y1], and the
+    values should fit into the image size which is {image.size}.
+    """
+    print(f"system_prompt: {system_prompt}")
+
+    return_packet = [None,None]
+    
+    if 'gemini' in model_name:
+        return_packet = gemini_identify_id(model_name,image,system_prompt)
+    elif 'llava' in model_name:
+        return_packet = huggingface_llava_15_7b_hf(model_name,image,system_prompt)
+    elif 'claude' in model_name:
+        return_packet = anthropic_identify_id(model_name,system_prompt,url)
+    return return_packet
+
+def anthropic_identify_id(model_name,system_prompt,url):
+    client = anthropic.Anthropic()
+    message = client.messages.create(
+        model = model_name,
+        max_tokens = 1024,
+        messages = [
+            {
+                "role":"user",
+                "content": [
+                    {
+                        "type":"image",
+                        "source":{
+                            "type":"url",
+                            'url':url
+                        },
+                    },
+                    {
+                        'type':'text',
+                        'text':system_prompt
+                    }
+                ],
+            }
+        ],
+    )
+    print(message)
+    return [None,None]
+
+def gemini_identify_id(model_name,image,system_prompt):
     # 2. Function to process image with Gemini Pro Vision
     try:
-        image = get_image(url)
-        
         genai.configure(api_key=get_secret('GEMINI_API'))
-
+        print(f"genai: {genai}")
         model = genai.GenerativeModel("gemini-2.0-flash")
+        print(f"model: {model}")
         response = model.generate_content([system_prompt, image])
+        print(f"response: {response}")
         response_text = response.text
+        print(f"response: {response_text}")
         if not response_text:
             print('Could not find an ID number')
-            exit()
-        print(response_text)
+            return [image,'no response was received']
     
     except Exception as e:
-        return f"Error processing image: {str(e)}",None
+        return [image,f"Error processing image: {str(e)}"]
     
     draw = ImageDraw.Draw(image)
+    print(f"draw: {draw}")
     draw.rectangle(ast.literal_eval(response_text),outline='yellow',width=5)
-    image.save(f'{os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}\\download\\{dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.jpg')
+    #image.save(f'{os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}\\download\\{dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.jpg')
+    return [image,response_text]
 
 # Huggingface repo usage
-def huggingface_detect_id_box(model_name,url):
+def huggingface_llava_15_7b_hf(model_name,image,system_prompt):
     try:
         #image = get_image(url)
-        image = Image.open(requests.get(url,stream=True).raw)
-        
-        system_prompt = f"""
-        You are an AI document processing assistant. Analyze the provided image. Identify the ID number in the document.
-        This is usually identified in a location outside of the main content on the document, and usually on the bottom
-        right or left of the document. The rotation of the number may differ based on images. Furthermore the ID number
-        is usually a string of numbers, around 9 number characters in length. Could possibly have alphabetic characters
-        as well but that looks to be rare. The output should only be a string in the format [x0,y0,x1,y1], and the
-        values should fit into the image size which is {image.size}.
-        """
-
         processor,model=load_model(model_name)
-
         conversation = [
             {
                 "role":"user",
@@ -99,8 +142,13 @@ def huggingface_detect_id_box(model_name,url):
                 ],
             },
         ]
+        print(f"conversation: {conversation}")
+        
         prompt = processor.apply_chat_template(conversation,add_generation_prompt=True)
+        print(f"prompt: {prompt}")
+        
         inputs = processor(images=image,text=prompt,return_tensors="pt").to(model.device)
+        print(f"inputs: {inputs}")
 
         """
         with torch.no_grad():
@@ -116,13 +164,26 @@ def huggingface_detect_id_box(model_name,url):
         """
 
         output = model.generate(**inputs,max_new_tokens=200,do_sample=False)
-        print(processor.decode(output[0][2:],skip_special_tokens=True))
+        print(f"output: {output}")
+        
+        response_string = processor.decode(output[0][2:],skip_special_tokens=True)
+        print(f"response_string: {response_string}")
+
+        match = re.search(r"ASSISTANT: \[(.*?)\]",response_string)
+        if not match:
+            return [image,"no match found"]
+        bbox = [image.size[0],image.size[1],image.size[0],image.size[1]]*ast.literal_eval([match.group(1)])
+        print(f"bbox: {bbox}")
 
         
         draw = ImageDraw.Draw(image)
+        print(f"draw: {draw}")
+        
         draw.rectangle(bbox,outline="red",width=5)
+        print(f"image: {image}")
+        
         #image.save(f'{os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}\\download\\{dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.jpg')
-        return image
+        return [image,bbox]
     except Exception as e:
         print(f"Error loading model or processing image: {str(e)}")
-        return None
+        return [image,"an error occurred processing request"]
